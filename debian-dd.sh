@@ -341,7 +341,7 @@ d-i partman/confirm boolean true
 
 ### Package selection
 tasksel tasksel/first multiselect standard, ssh-server
-d-i pkgsel/include string lrzsz net-tools vim rsync socat curl sudo wget telnet iptables gpg zsh python3 python3-pip nmap tree iperf3 vnstat ufw
+d-i pkgsel/include string lrzsz net-tools vim rsync socat curl sudo wget telnet iptables gpg zsh python3 python3-pip nmap tree iperf3 vnstat ufw unzip
 
 d-i pkgsel/update-policy select none
 d-i pkgsel/upgrade select none
