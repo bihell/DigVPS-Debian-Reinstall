@@ -171,12 +171,16 @@ fi
 if [ -z "$PRIMARY_IFACE" ]; then
     echo "No physical network interface detected." && exit 1
 fi
+PRIMARY_MAC=$(cat "/sys/class/net/$PRIMARY_IFACE/address" 2>/dev/null || true)
 
 # IPv4 details
 IPV4_CIDR=$(ip -4 -o addr show dev "$PRIMARY_IFACE" scope global | awk '{print $4}' | head -n1)
 IPV4_ADDR=${IPV4_CIDR%%/*}
 IPV4_PREFIX=${IPV4_CIDR##*/}
-IPV4_GATEWAY=$(ip -4 route show default dev "$PRIMARY_IFACE" 2>/dev/null | awk '/default/ {print $3; exit}')
+IPV4_DEFAULT_ROUTE=$(ip -4 route show default dev "$PRIMARY_IFACE" 2>/dev/null | head -n1)
+IPV4_GATEWAY=$(echo "$IPV4_DEFAULT_ROUTE" | awk '/default/ {print $3; exit}')
+IPV4_ONLINK=""
+echo "$IPV4_DEFAULT_ROUTE" | grep -qw onlink && IPV4_ONLINK="yes"
 
 # Convert prefix to netmask (e.g., 24 -> 255.255.255.0)
 to_netmask() {
@@ -193,7 +197,10 @@ if [ -n "$IPV4_PREFIX" ]; then IPV4_NETMASK=$(to_netmask "$IPV4_PREFIX"); fi
 
 # IPv6 details (global address only)
 # Detect IPv6 default gateway by explicitly extracting the token after 'via' and strip zone id (e.g., %eth0)
-IPV6_GATEWAY=$(ip -6 route show default dev "$PRIMARY_IFACE" 2>/dev/null \
+IPV6_DEFAULT_ROUTE=$(ip -6 route show default dev "$PRIMARY_IFACE" 2>/dev/null | head -n1)
+IPV6_ONLINK=""
+echo "$IPV6_DEFAULT_ROUTE" | grep -qw onlink && IPV6_ONLINK="yes"
+IPV6_GATEWAY=$(echo "$IPV6_DEFAULT_ROUTE" \
     | awk '($1=="default"){for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}' \
     | sed 's/%.*//')
 # Sanity: if awk somehow yielded a bare integer (e.g., mis-parse), drop it
@@ -210,11 +217,23 @@ IFUPDOWN_IPV4_METHOD="dhcp"
 IFUPDOWN_IPV6_METHOD="auto"
 [ -n "$IPV6_ADDR" ] && IFUPDOWN_IPV6_METHOD="static"
 
+IFUPDOWN_IPV4_GATEWAY_LINE=""
+IFUPDOWN_IPV4_ROUTE_LINES=""
+if [ -n "$IPV4_GATEWAY" ]; then
+    if [ "$IPV4_PREFIX" = "32" ] || [ "$IPV4_ONLINK" = "yes" ]; then
+        IFUPDOWN_IPV4_ROUTE_LINES="'    post-up ip route replace default via ${IPV4_GATEWAY} dev \\\$IFACE onlink' '    pre-down ip route del default via ${IPV4_GATEWAY} dev \\\$IFACE || true'"
+    else
+        IFUPDOWN_IPV4_GATEWAY_LINE="'    gateway ${IPV4_GATEWAY}'"
+    fi
+fi
+
 IFUPDOWN_IPV6_GATEWAY_LINE=""
 IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES=""
 if [ -n "$IPV6_GATEWAY" ]; then
     if echo "$IPV6_GATEWAY" | grep -qi '^fe80:'; then
-        IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES="'    post-up ip -6 route replace default via ${IPV6_GATEWAY} dev \$IFACE' '    pre-down ip -6 route del default via ${IPV6_GATEWAY} dev \$IFACE || true'"
+        IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES="'    post-up ip -6 route replace default via ${IPV6_GATEWAY} dev \\\$IFACE' '    pre-down ip -6 route del default via ${IPV6_GATEWAY} dev \\\$IFACE || true'"
+    elif [ "$IPV6_PREFIX" = "128" ] || [ "$IPV6_ONLINK" = "yes" ]; then
+        IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES="'    post-up ip -6 route replace default via ${IPV6_GATEWAY} dev \\\$IFACE onlink' '    pre-down ip -6 route del default via ${IPV6_GATEWAY} dev \\\$IFACE || true'"
     else
         IFUPDOWN_IPV6_GATEWAY_LINE="'    gateway ${IPV6_GATEWAY}'"
     fi
@@ -288,7 +307,7 @@ ${IPV4_GATEWAY:+d-i netcfg/get_gateway string $IPV4_GATEWAY}
 d-i netcfg/get_nameservers string $NAMESERVERS
 ${IPV4_ADDR:+d-i netcfg/confirm_static boolean true}
 # IPv6: enable and seed static values if detected; otherwise allow RA/DHCPv6
- d-i netcfg/enable_ipv6 boolean true
+d-i netcfg/enable_ipv6 boolean true
 
 ### Low memory mode
 d-i lowmem/low note
@@ -346,6 +365,11 @@ d-i preseed/late_command string \
 sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /target/etc/ssh/sshd_config; \
 sed -ri 's/^#?Port.*/Port ${sshPORT}/g' /target/etc/ssh/sshd_config; \
 ${BBR} \
+ TARGET_IFACE=\$(awk '\$1=="iface" && \$2!="lo" && \$3=="inet" {print \$2; exit}' /target/etc/network/interfaces 2>/dev/null); \
+ [ -n "\$TARGET_IFACE" ] || TARGET_IFACE=\$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i=="dev"){print \$(i+1); exit}}}'); \
+ [ -n "\$TARGET_IFACE" ] || TARGET_IFACE=\$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i=="dev"){print \$(i+1); exit}}}'); \
+ [ -n "\$TARGET_IFACE" ] || TARGET_IFACE="${PRIMARY_IFACE}"; \
+ echo "debian-dd.sh final network interface: \$TARGET_IFACE (source ${PRIMARY_IFACE}, mac ${PRIMARY_MAC})" > /target/root/debian-dd-network.log; \
  in-target mkdir -p /etc/network/interfaces.d; \
  in-target /bin/sh -c "printf '%s\n' \
  '# This file is managed by debian-dd.sh.' \
@@ -354,14 +378,16 @@ ${BBR} \
  'auto lo' \
  'iface lo inet loopback' \
  '' \
- 'allow-hotplug ${PRIMARY_IFACE}' \
- 'iface ${PRIMARY_IFACE} inet ${IFUPDOWN_IPV4_METHOD}' \
+ 'auto '\${TARGET_IFACE} \
+ 'allow-hotplug '\${TARGET_IFACE} \
+ 'iface '\${TARGET_IFACE}' inet ${IFUPDOWN_IPV4_METHOD}' \
  ${IPV4_ADDR:+"'    address ${IPV4_ADDR}'"} \
  ${IPV4_NETMASK:+"'    netmask ${IPV4_NETMASK}'"} \
- ${IPV4_GATEWAY:+"'    gateway ${IPV4_GATEWAY}'"} \
+ ${IFUPDOWN_IPV4_GATEWAY_LINE} \
+ ${IFUPDOWN_IPV4_ROUTE_LINES} \
  ${NAMESERVERS:+"'    dns-nameservers ${NAMESERVERS}'"} \
  '' \
- 'iface ${PRIMARY_IFACE} inet6 ${IFUPDOWN_IPV6_METHOD}' \
+ 'iface '\${TARGET_IFACE}' inet6 ${IFUPDOWN_IPV6_METHOD}' \
  ${IPV6_ADDR:+"'    address ${IPV6_ADDR}'"} \
  ${IPV6_PREFIX:+"'    netmask ${IPV6_PREFIX}'"} \
  ${IFUPDOWN_IPV6_GATEWAY_LINE} \
@@ -394,6 +420,7 @@ echo "Reinstall summary (what the installer will use):"
 echo "  Root disk      : /dev/${DEVICE_PREFIX} (GRUB target)"
 echo "  Boot partition : (hd0,${partitionr_root_number}) in GRUB entry"
 echo "  Interface      : ${PRIMARY_IFACE}"
+if [ -n "${PRIMARY_MAC}" ]; then echo "  MAC            : ${PRIMARY_MAC}"; fi
 if [ -n "${IPV4_ADDR}" ]; then echo "  IPv4           : ${IPV4_ADDR}/${IPV4_PREFIX}  gw ${IPV4_GATEWAY}"; else echo "  IPv4           : (none)"; fi
 if [ -n "${IPV6_ADDR}" ]; then echo "  IPv6           : ${IPV6_ADDR}/${IPV6_PREFIX}  gw ${IPV6_GATEWAY}"; else echo "  IPv6           : (none)"; fi
 echo "  DNS            : ${NAMESERVERS}"
