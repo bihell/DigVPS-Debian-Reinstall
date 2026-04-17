@@ -172,10 +172,6 @@ if [ -z "$PRIMARY_IFACE" ]; then
     echo "No physical network interface detected." && exit 1
 fi
 
-# Derive stable match key for post-install network config (prefer MAC over name)
-IF_MAC=$(cat "/sys/class/net/$PRIMARY_IFACE/address" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-[ -n "$IF_MAC" ] && MATCH_LINE="MACAddress=$IF_MAC" || MATCH_LINE="Name=$PRIMARY_IFACE"
-
 # IPv4 details
 IPV4_CIDR=$(ip -4 -o addr show dev "$PRIMARY_IFACE" scope global | awk '{print $4}' | head -n1)
 IPV4_ADDR=${IPV4_CIDR%%/*}
@@ -207,24 +203,21 @@ IPV6_CIDR=$(ip -6 -o addr show dev "$PRIMARY_IFACE" scope global | awk '{print $
 IPV6_ADDR=${IPV6_CIDR%%/*}
 IPV6_PREFIX=${IPV6_CIDR##*/}
 
-# If IPv6 gateway is link-local, networkd needs GatewayOnLink=yes
-IPV6_GW_ONLINK=""
-if [ -n "$IPV6_GATEWAY" ] && echo "$IPV6_GATEWAY" | grep -qi '^fe80:'; then
-    IPV6_GW_ONLINK="GatewayOnLink=yes"
-fi
+# ifupdown target methods. Keep DHCP/RA fallback when no static value is detected.
+IFUPDOWN_IPV4_METHOD="dhcp"
+[ -n "$IPV4_ADDR" ] && IFUPDOWN_IPV4_METHOD="static"
 
-# Decide whether to accept IPv6 RA for auto-config (only emit when needed)
-IPV6_ACCEPT_RA_LINE=""
-[ -z "$IPV6_ADDR" ] && IPV6_ACCEPT_RA_LINE="IPv6AcceptRA=yes"
+IFUPDOWN_IPV6_METHOD="auto"
+[ -n "$IPV6_ADDR" ] && IFUPDOWN_IPV6_METHOD="static"
 
-# Decide systemd-networkd DHCP mode based on what we detected
-NETWORKD_DHCP=""
-if [ -z "$IPV4_ADDR" ] && [ -z "$IPV6_ADDR" ]; then
-    NETWORKD_DHCP="DHCP=yes"   # no static addresses detected; allow both
-elif [ -z "$IPV4_ADDR" ] && [ -n "$IPV6_ADDR" ]; then
-    NETWORKD_DHCP="DHCP=ipv4"  # v6 static/auto present; also try v4 via DHCP if available
-elif [ -n "$IPV4_ADDR" ] && [ -z "$IPV6_ADDR" ]; then
-    NETWORKD_DHCP="DHCP=ipv6"  # v4 static present; also try v6 via RA/DHCPv6
+IFUPDOWN_IPV6_GATEWAY_LINE=""
+IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES=""
+if [ -n "$IPV6_GATEWAY" ]; then
+    if echo "$IPV6_GATEWAY" | grep -qi '^fe80:'; then
+        IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES="'    post-up ip -6 route replace default via ${IPV6_GATEWAY} dev \$IFACE' '    pre-down ip -6 route del default via ${IPV6_GATEWAY} dev \$IFACE || true'"
+    else
+        IFUPDOWN_IPV6_GATEWAY_LINE="'    gateway ${IPV6_GATEWAY}'"
+    fi
 fi
 
 # DNS selection (user choice: default to Google IPv4/IPv6)
@@ -260,8 +253,6 @@ NAMESERVERS="$(echo $NS_V4 $NS_V6 | xargs)"
 if [ -z "$NAMESERVERS" ]; then
     NAMESERVERS="$GOOGLE_NS_V4 $GOOGLE_NS_V6"
 fi
-# Prepare systemd-networkd DNS line (per-link DNS for resolved)
-NETWORKD_DNS_LINE="DNS=$NAMESERVERS"
 
 echo -en "\n${aoiBlue}Download boot file...${plain}\n"
 wget -q -O linux "https://ftp.debian.org/debian/dists/$debian_version/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux" || { echo "Error: failed to download netboot kernel (linux)." >&2; exit 1; }
@@ -341,7 +332,7 @@ d-i partman/confirm boolean true
 
 ### Package selection
 tasksel tasksel/first multiselect standard, ssh-server
-d-i pkgsel/include string lrzsz net-tools vim rsync socat curl sudo wget telnet iptables gpg zsh python3 python3-pip nmap tree iperf3 vnstat ufw unzip
+d-i pkgsel/include string ifupdown lrzsz net-tools vim rsync socat curl sudo wget telnet iptables gpg zsh python3 python3-pip nmap tree iperf3 vnstat ufw unzip
 
 d-i pkgsel/update-policy select none
 d-i pkgsel/upgrade select none
@@ -355,29 +346,29 @@ d-i preseed/late_command string \
 sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /target/etc/ssh/sshd_config; \
 sed -ri 's/^#?Port.*/Port ${sshPORT}/g' /target/etc/ssh/sshd_config; \
 ${BBR} \
- in-target apt-get update; \
- in-target apt-get -y install systemd-networkd; \
- in-target mkdir -p /etc/systemd/network; \
+ in-target mkdir -p /etc/network/interfaces.d; \
  in-target /bin/sh -c "printf '%s\n' \
- '[Match]' \
- '${MATCH_LINE}' \
+ '# This file is managed by debian-dd.sh.' \
+ 'source /etc/network/interfaces.d/*' \
  '' \
- '[Network]' \
- ${NETWORKD_DNS_LINE:+"'${NETWORKD_DNS_LINE}'"} \
- ${NETWORKD_DHCP:+"'${NETWORKD_DHCP}'"} \
- ${IPV6_ACCEPT_RA_LINE:+"'${IPV6_ACCEPT_RA_LINE}'"} \
- ${IPV4_ADDR:+"'Address=${IPV4_ADDR}/${IPV4_PREFIX}'"} \
- ${IPV4_GATEWAY:+"'Gateway=${IPV4_GATEWAY}'"} \
- ${IPV6_ADDR:+"'Address=${IPV6_ADDR}/${IPV6_PREFIX}'"} \
- ${IPV6_GATEWAY:+"'Gateway=${IPV6_GATEWAY}'"} \
- ${IPV6_GW_ONLINK:+"'GatewayOnLink=yes'"} \
- > /etc/systemd/network/10-main.network"; \
- in-target apt-get -y install systemd-resolved; \
- in-target ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf; \
- in-target systemctl enable --now systemd-resolved.service; \
- in-target systemctl enable systemd-networkd.service; \
- in-target systemctl restart systemd-networkd.service; \
- in-target apt-get -y purge ifupdown || true;
+ 'auto lo' \
+ 'iface lo inet loopback' \
+ '' \
+ 'allow-hotplug ${PRIMARY_IFACE}' \
+ 'iface ${PRIMARY_IFACE} inet ${IFUPDOWN_IPV4_METHOD}' \
+ ${IPV4_ADDR:+"'    address ${IPV4_ADDR}'"} \
+ ${IPV4_NETMASK:+"'    netmask ${IPV4_NETMASK}'"} \
+ ${IPV4_GATEWAY:+"'    gateway ${IPV4_GATEWAY}'"} \
+ ${NAMESERVERS:+"'    dns-nameservers ${NAMESERVERS}'"} \
+ '' \
+ 'iface ${PRIMARY_IFACE} inet6 ${IFUPDOWN_IPV6_METHOD}' \
+ ${IPV6_ADDR:+"'    address ${IPV6_ADDR}'"} \
+ ${IPV6_PREFIX:+"'    netmask ${IPV6_PREFIX}'"} \
+ ${IFUPDOWN_IPV6_GATEWAY_LINE} \
+ ${IFUPDOWN_IPV6_LINKLOCAL_ROUTE_LINES} \
+ > /etc/network/interfaces"; \
+ in-target /bin/sh -c "rm -f /etc/resolv.conf; : > /etc/resolv.conf; for ns in ${NAMESERVERS}; do printf 'nameserver %s\n' \"\$ns\" >> /etc/resolv.conf; done"; \
+ in-target systemctl disable systemd-networkd.service systemd-resolved.service 2>/dev/null || true;
 ### Shutdown machine
 d-i finish-install/reboot_in_progress note
 EOF
