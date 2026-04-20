@@ -379,7 +379,6 @@ ${BBR} \
  [ -n "\$TARGET_IFACE" ] || TARGET_IFACE=\$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i=="dev"){print \$(i+1); exit}}}'); \
  [ -n "\$TARGET_IFACE" ] || TARGET_IFACE=\$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i=="dev"){print \$(i+1); exit}}}'); \
  [ -n "\$TARGET_IFACE" ] || TARGET_IFACE="${PRIMARY_IFACE}"; \
- echo "debian-dd.sh final network interface: \$TARGET_IFACE (source ${PRIMARY_IFACE}, mac ${PRIMARY_MAC})" > /target/root/debian-dd-network.log; \
  in-target mkdir -p /etc/network/interfaces.d; \
  in-target /bin/sh -c "printf '%s\n' \
  '# This file is managed by debian-dd.sh.' \
